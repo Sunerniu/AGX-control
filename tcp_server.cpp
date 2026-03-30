@@ -35,14 +35,11 @@ static std::atomic<E_TcpServerState> s_serverState(TCP_SERVER_STATE_IDLE);
 static T_DjiTaskHandle s_serverThreadHandle = NULL;
 static TcpCommandHandler s_commandHandler = NULL;
 
-// 心跳超时检测相关
-static std::chrono::steady_clock::time_point s_lastHeartbeatTime;
-static std::atomic<bool> s_heartbeatActive(false);
-static std::atomic<bool> s_hoverTriggered(false);
-static std::atomic<bool> s_goHomeTriggered(false);
+// 断线超时检测相关
+static std::chrono::steady_clock::time_point s_lastDisconnectTime;
+static std::atomic<bool> s_disconnectTimeoutTriggered(false);
 
 /* Private functions declaration -------------------------------------*/
-static void CheckAndTriggerHeartbeatTimeouts(void);
 static void *ServerThreadEntry(void *arg);
 static int DefaultCommandHandler(const T_ControlPacket *packet);
 static void HandleClientConnection(int clientSocket);
@@ -191,25 +188,6 @@ T_DjiReturnCode TcpServer_RegisterCommandHandler(TcpCommandHandler handler) {
 
 /* Private functions definition --------------------------------------*/
 
-static void CheckAndTriggerHeartbeatTimeouts(void) {
-  if (!s_heartbeatActive) return;
-
-  auto now = std::chrono::steady_clock::now();
-  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                     now - s_lastHeartbeatTime)
-                     .count();
-
-  if (elapsed > TCP_SERVER_GOHOME_TIMEOUT_MS && !s_goHomeTriggered) {
-    USER_LOG_WARN("TCP heartbeat timeout (>%dms), auto return-to-home!", TCP_SERVER_GOHOME_TIMEOUT_MS);
-    CommandControl_GoHome();
-    s_goHomeTriggered = true;
-  } else if (elapsed > TCP_SERVER_HOVER_TIMEOUT_MS && !s_hoverTriggered) {
-    USER_LOG_WARN("TCP heartbeat timeout (>%dms), triggering hover!", TCP_SERVER_HOVER_TIMEOUT_MS);
-    CommandControl_Hover();
-    s_hoverTriggered = true;
-  }
-}
-
 static void *ServerThreadEntry(void *arg) {
   (void)arg;
   struct sockaddr_in clientAddr;
@@ -230,9 +208,25 @@ static void *ServerThreadEntry(void *arg) {
 
     int selectResult = select(s_serverSocket + 1, &readfds, NULL, NULL, &tv);
 
-    // 检查心跳追踪与断线超时
-    if (s_serverState != TCP_SERVER_STATE_CONNECTED) {
-      CheckAndTriggerHeartbeatTimeouts();
+    // 检查断线超时 (无客户端连接时)
+    if (s_serverState != TCP_SERVER_STATE_CONNECTED &&
+        !s_disconnectTimeoutTriggered) {
+      auto now = std::chrono::steady_clock::now();
+      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         now - s_lastDisconnectTime)
+                         .count();
+      if (elapsed > TCP_SERVER_DISCONNECT_TIMEOUT_MS) {
+        T_NavState navState;
+        if (CommandControl_GetNavState(&navState) ==
+                DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS &&
+            navState.isNavigating) {
+          USER_LOG_WARN(
+              "TCP disconnect timeout (>%dms), auto-stopping navigation!",
+              TCP_SERVER_DISCONNECT_TIMEOUT_MS);
+          CommandControl_StopNavigation();
+        }
+        s_disconnectTimeoutTriggered = true;
+      }
     }
 
     if (selectResult <= 0) {
@@ -257,18 +251,17 @@ static void *ServerThreadEntry(void *arg) {
                   ntohs(clientAddr.sin_port));
 
     s_serverState = TCP_SERVER_STATE_CONNECTED;
-    s_heartbeatActive = true;
-    s_lastHeartbeatTime = std::chrono::steady_clock::now();
-    s_hoverTriggered = false;
-    s_goHomeTriggered = false;
+    s_disconnectTimeoutTriggered = false; // 重置断线超时标志
 
     // Handle client
     HandleClientConnection(s_clientSocket);
 
-    // Client disconnected - 断开连接时，心跳继续计时，直到重新连接或超时
+    // Client disconnected - 记录断开时间
     close(s_clientSocket);
     s_clientSocket = -1;
-    USER_LOG_INFO("TCP client disconnected, continuing disconnect timer");
+    s_lastDisconnectTime = std::chrono::steady_clock::now();
+    s_disconnectTimeoutTriggered = false;
+    USER_LOG_INFO("TCP client disconnected, starting disconnect timer");
   }
 
   USER_LOG_INFO("TCP server thread exited");
@@ -294,22 +287,12 @@ static void HandleClientConnection(int clientSocket) {
         break;
       }
       // Timeout or error, continue waiting
-      CheckAndTriggerHeartbeatTimeouts();
       continue;
     }
 
     if (bytesRead != PROTOCOL_PACKET_SIZE) {
       USER_LOG_WARN("TCP received incomplete packet: %zd bytes", bytesRead);
-      CheckAndTriggerHeartbeatTimeouts();
       continue;
-    }
-
-    // 收到合法数据包，更新心跳并复位触发状态
-    s_lastHeartbeatTime = std::chrono::steady_clock::now();
-    if (s_hoverTriggered || s_goHomeTriggered) {
-      USER_LOG_INFO("TCP heartbeat restored");
-      s_hoverTriggered = false;
-      s_goHomeTriggered = false;
     }
 
     // Validate packet

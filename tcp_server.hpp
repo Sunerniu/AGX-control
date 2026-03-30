@@ -23,8 +23,8 @@ extern "C" {
 #define TCP_SERVER_DEFAULT_PORT 8080    // 默认监听端口
 #define TCP_SERVER_MAX_CLIENTS 1        // 最大客户端数量 (目前只支持1个)
 #define TCP_SERVER_RECV_TIMEOUT_MS 1000 // 接收超时 (毫秒)
-#define TCP_SERVER_HOVER_TIMEOUT_MS 10000    // 断连或心跳超时悬停阈值 (10秒)
-#define TCP_SERVER_GOHOME_TIMEOUT_MS 20000   // 断连或心跳超时自动返航阈值 (20秒)
+#define TCP_SERVER_DISCONNECT_TIMEOUT_MS                                       \
+  10000 // 断线超时阈值 (10秒，超时后自动停止导航)
 
 /* Exported types ------------------------------------------------------------*/
 
